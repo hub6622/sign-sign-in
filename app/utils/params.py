@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import random
 import re
@@ -29,6 +30,78 @@ def _normalize_header_token_value(value):
         except TypeError:
             return str(value)
     return str(value)
+
+
+def _sanitize_sign_text(value):
+    return (
+        str(value)
+        .replace(" ", "")
+        .replace("\n", "")
+        .replace("\r", "")
+        .replace("<", "")
+        .replace(">", "")
+        .replace("&", "")
+        .replace("-", "")
+        .replace(r"\uD83C[\uDF00-\uDFFF]", "")
+        .replace(r"\uD83D[\uDC00-\uDE4F]", "")
+    )
+
+
+def _normalize_security_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple, dict, set)):
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except TypeError:
+            return str(value)
+    return str(value)
+
+
+def _djb2(value):
+    result = 5381
+    for char in str(value or ""):
+        result = ((result * 33) + ord(char)) & 0xFFFFFFFF
+    return result
+
+
+def _security_data_sign(data):
+    special_char_regex = re.compile(r"[`~!@#$%^&*()+=|{}':;',\[\].<>/?~锛丂#锟?鈥︹€?*锛堬級鈥斺€?|{}銆愩€戔€橈紱锛氣€濃€溾€欍€傦紝銆侊紵]")
+    raw = ""
+    for key in sorted(k for k in data if k not in ("h5st", "_stk", "_ste")):
+        value_text = _normalize_security_value(data[key])
+        if key not in XYB_EXCLUDED_KEYS and not special_char_regex.search(value_text):
+            raw += f"{key}{value_text}"
+    return urllib.parse.quote(_sanitize_sign_text(raw).replace("[]", ""))
+
+
+def create_security_fingerprint():
+    return hashlib.md5(f"{int(time.time() * 1000)}_{random.random()}".encode("utf-8")).hexdigest()
+
+
+def get_security_url_token(security_token):
+    return str(_djb2(security_token))
+
+
+def get_security_params(data, security_token, fingerprint):
+    timestamp = int(time.time() * 1000)
+    app_sign = hashlib.md5(f"{_djb2(security_token)}{fingerprint}{timestamp}{XYB_APP_ID}".encode("utf-8")).hexdigest()
+    data_sign = _security_data_sign(data)
+    sign_type = str(security_token or "")[:1]
+    st = ""
+    if sign_type == "0":
+        st = hashlib.md5(f"{data_sign}{app_sign}".encode("utf-8")).hexdigest()
+    elif sign_type == "1":
+        st = hashlib.sha256(f"{data_sign}{app_sign}".encode("utf-8")).hexdigest()
+    elif security_token:
+        st = hmac.new(str(app_sign).encode("utf-8"), str(data_sign).encode("utf-8"), hashlib.sha256).hexdigest()
+    return {
+        "st": st,
+        "ts": str(timestamp),
+        "fp": fingerprint,
+    }
 
 
 def get_device_code(openId, device):
@@ -77,15 +150,7 @@ def get_header_token(e):
     d = f"{d}{l}{g}"
 
     # 清理掉不需要的字符
-    d = (d.replace(" ", "")
-         .replace("\n", "")
-         .replace("\r", "")
-         .replace("<", "")
-         .replace(">", "")
-         .replace("&", "")
-         .replace("-", "")
-         .replace(r"\uD83C[\uDF00-\uDFFF]", "")
-         .replace(r"\uD83D[\uDC00-\uDE4F]", ""))
+    d = _sanitize_sign_text(d)
 
     # URL 编码
     d = urllib.parse.quote(d)

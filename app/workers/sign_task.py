@@ -8,7 +8,7 @@ import time
 import requests
 from PySide6.QtCore import QThread, Signal
 
-from app.apis.xybsyw import login, get_plan, regeo, photo_sign_in_or_out, simple_sign_in_or_out
+from app.apis.xybsyw import login, get_plan, get_default_plan, regeo, photo_sign_in_or_out, simple_sign_in_or_out
 from app.config.common import CERT_FILE, MITM_PROXY, XYB_APP_ID
 from app.mitm.cert_state import remember_current_cert_installed, summarize_cert_state
 from app.utils.code_channel import CodeChannel
@@ -192,6 +192,37 @@ class SignTaskThread(QThread):
 
         return channel.wait_code(timeout_seconds=120, stop_check=self.check_stop, heartbeat=heartbeat)
 
+    @staticmethod
+    def _find_first_trainee_id(value):
+        if isinstance(value, dict):
+            trainee_id = value.get("traineeId")
+            if trainee_id:
+                return trainee_id
+            clock_vo = value.get("clockVo")
+            if isinstance(clock_vo, dict) and clock_vo.get("traineeId"):
+                return clock_vo.get("traineeId")
+            for item in value.values():
+                found = SignTaskThread._find_first_trainee_id(item)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = SignTaskThread._find_first_trainee_id(item)
+                if found:
+                    return found
+        return None
+
+    def _resolve_trainee_id(self, config, args, plan_data):
+        trainee_id = self._find_first_trainee_id(plan_data)
+        if trainee_id:
+            return trainee_id
+        logging.info("实习计划列表中未找到 traineeId，尝试读取默认实习计划...")
+        default_plan = get_default_plan(userAgent=config['userAgent'], args=args, config=config)
+        trainee_id = self._find_first_trainee_id(default_plan)
+        if trainee_id:
+            return trainee_id
+        raise RuntimeError("获取实习计划失败：未找到 traineeId")
+
     def execute_logic(self, config):
         logging.info("🚀 开始业务逻辑...")
 
@@ -200,7 +231,8 @@ class SignTaskThread(QThread):
         args = login(config, use_cache=True)
 
         self.check_stop()
-        plan_data = get_plan(userAgent=config['userAgent'], args=args)
+        plan_data = get_plan(userAgent=config['userAgent'], args=args, config=config)
+        trainee_id = self._resolve_trainee_id(config, args, plan_data)
 
         self.check_stop()
         geo = regeo(
@@ -214,7 +246,7 @@ class SignTaskThread(QThread):
 
         action = self.sign_option['action']
         if action in ['普通签到', '普通签退']:
-            simple_sign_in_or_out(args=args, config=config, geo=geo, traineeId=plan_data[0]['dateList'][0]['traineeId'],
+            simple_sign_in_or_out(args=args, config=config, geo=geo, traineeId=trainee_id,
                                   opt=self.sign_option)
         elif action == '普通签到签退':
             for step in self.sign_option.get('steps', []):
@@ -223,11 +255,11 @@ class SignTaskThread(QThread):
                     args=args,
                     config=config,
                     geo=geo,
-                    traineeId=plan_data[0]['dateList'][0]['traineeId'],
+                    traineeId=trainee_id,
                     opt=step,
                 )
         elif action in ['拍照签到', '拍照签退']:
-            photo_sign_in_or_out(args=args, config=config, geo=geo, traineeId=plan_data[0]['dateList'][0]['traineeId'],
+            photo_sign_in_or_out(args=args, config=config, geo=geo, traineeId=trainee_id,
                                  opt=self.sign_option)
 
     def do_cert(self):

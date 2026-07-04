@@ -1,11 +1,20 @@
 import logging
+import os
+import tempfile
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 
-from app.config.common import XYB_VERSION, XYB_REFERER, AMAP_WEB_KEY
+from app.config.common import XYB_VERSION, XYB_REFERER, AMAP_WEB_KEY, XYB_N_HEADER
 from app.utils.common import get_timestamp
-from app.utils.files import get_img_file, clear_session_cache
-from app.utils.params import get_header_token, get_device_code
+from app.utils.files import get_img_file, clear_session_cache, check_img
+from app.utils.params import (
+    create_security_fingerprint,
+    get_device_code,
+    get_header_token,
+    get_security_params,
+    get_security_url_token,
+)
 
 TENCENT_MAP_KEY = "GOZBZ-E4L67-6WLXT-PSLBH-2WEZZ-LOFLE"
 
@@ -56,6 +65,119 @@ def _normalize_map_provider(provider):
 def _map_key(custom_key, default_key):
     key = str(custom_key or "").strip()
     return key or default_key
+
+
+def _response_message(data):
+    if isinstance(data, dict):
+        msg = data.get("msg", data.get("message"))
+        if msg is not None and str(msg).strip():
+            return str(msg)
+    return str(data)
+
+
+def _is_success_code(code):
+    return code == "200" or code == 200
+
+
+def _assert_session(response_json):
+    if not check_session_validity(response_json):
+        handle_invalid_session()
+        raise RuntimeError('❌ JSESSIONID已失效，请重新获取Code')
+
+
+def _require_data(response, context):
+    try:
+        res = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"{context}: 响应解析失败 {exc}") from exc
+    _assert_session(res)
+    if response.status_code != 200 or not _is_success_code(res.get("code")) or "data" not in res:
+        raise RuntimeError(f"{context}: {_response_message(res)}")
+    return res.get("data")
+
+
+def _require_success(response, context):
+    try:
+        res = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"{context}: 响应解析失败 {exc}") from exc
+    _assert_session(res)
+    if response.status_code != 200 or not _is_success_code(res.get("code")):
+        raise RuntimeError(f"{context}: {_response_message(res)}")
+    return res
+
+
+def _security_fingerprint(config):
+    if not config.get("securityFingerprint"):
+        config["securityFingerprint"] = create_security_fingerprint()
+    return config["securityFingerprint"]
+
+
+def _base_xyb_headers(config):
+    return {
+        "v": XYB_VERSION,
+        "xweb_xhr": "1",
+        "content-type": "application/x-www-form-urlencoded",
+        "referer": XYB_REFERER,
+        "User-Agent": config["userAgent"],
+    }
+
+
+def _fetch_security_token(config, fingerprint, args=None, timeout=5):
+    url = "https://xcx.xybsyw.com/common/GetToken.action"
+    headers = _base_xyb_headers(config)
+    cookies = {"JSESSIONID": args["sessionId"]} if args and args.get("sessionId") else None
+    logging.debug(f"准备请求校友邦风控Token: url:{url}, headers:{headers}, data:{{'fp': '***'}}, cookies:{cookies}")
+    response = requests.post(url, headers=headers, cookies=cookies, data={"fp": fingerprint}, timeout=timeout)
+    logging.debug(f"收到风控Token响应: {response} {response.text}")
+    data = _require_data(response, "获取校友邦风控Token失败")
+    if not data:
+        raise RuntimeError("获取校友邦风控Token失败: data为空")
+    return str(data)
+
+
+def _build_security_context(data, config, args=None):
+    fingerprint = _security_fingerprint(config)
+    security_token = _fetch_security_token(config, fingerprint, args=args)
+    return {
+        "params": get_security_params(data, security_token, fingerprint),
+        "url_token": get_security_url_token(security_token),
+    }
+
+
+def _form_post(url, data, config, args, include_device_code=False, timeout=5):
+    security = _build_security_context(data, config, args=args)
+    request_data = {**data, **security["params"]}
+    headers = {
+        **_base_xyb_headers(config),
+        "encryptvalue": args["encryptValue"],
+        "n": XYB_N_HEADER,
+        "wechat": "1",
+    }
+    if include_device_code:
+        headers["devicecode"] = get_device_code(openId=args.get("openId", ""), device=config["device"])
+    cookies = {"JSESSIONID": args["sessionId"]}
+    logging.debug(f"准备发起校友邦请求。url:{url}, headers:{headers}, data:{request_data}, cookies:{cookies}")
+    response = requests.post(
+        url,
+        headers=headers,
+        cookies=cookies,
+        data=request_data,
+        params={"t": security["url_token"]},
+        timeout=timeout,
+    )
+    logging.debug(f"收到响应:{response} {response.text}")
+    return response
+
+
+def _is_plan_empty_body(data):
+    message = _response_message(data)
+    lower = message.lower()
+    return (
+        ("列表" in message and "空" in message)
+        or ("list" in lower and "empty" in lower)
+        or "empty list" in lower
+    )
 
 
 def _normalize_tencent_regeo(result):
@@ -149,65 +271,68 @@ def regeo(userAgent, location, provider="amap", map_keys=None):
         raise e
 
 
-def get_plan(userAgent, args):
+def get_plan(userAgent, args, config=None):
     logging.info('正在获取实习计划...')
     url = "https://xcx.xybsyw.com/student/clock/GetPlan.action"
     data = {}
-    header_token = get_header_token(data)
-    headers = {
-        "v": XYB_VERSION,
-        "wechat": "1",
-        "xweb_xhr": "1",
-        "content-type": "application/x-www-form-urlencoded",
-        "encryptvalue": args['encryptValue'],
-        "n": header_token['n'],
-        "referer": XYB_REFERER,
-        "m": header_token['m'],
-        "s": header_token['s'],
-        "t": header_token['t'],
-        'user-agent': userAgent,
-    }
-    cookies = {
-        "JSESSIONID": args['sessionId']
-    }
+    config = config if isinstance(config, dict) else {"userAgent": userAgent}
 
     try:
-        logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-        response = requests.post(url, headers=headers, cookies=cookies, data=data, timeout=5)
-        logging.debug(f"📡 收到响应:{response} {response.text}")
+        response = _form_post(url, data, config=config, args=args, include_device_code=False, timeout=5)
         res = response.json()
-        if not check_session_validity(res):
-            handle_invalid_session()
-            raise RuntimeError('❌ JSESSIONID已失效，请重新获取code')
+        _assert_session(res)
+        if _is_plan_empty_body(res):
+            return []
         if 'data' in res and res['data']:
             return res['data']
-        else:
-            raise RuntimeError(f"获取计划失败: {res.get('msg', 'Unknown error')}")
+        raise RuntimeError(f"获取计划失败: {res.get('msg', 'Unknown error')}")
     except Exception as e:
         raise RuntimeError(f"计划接口请求异常: {e}")
 
 
+def get_default_plan(userAgent, args, config=None):
+    logging.info('正在获取默认实习计划...')
+    url = "https://xcx.xybsyw.com/student/clock/GetPlan!getDefault.action"
+    data = {}
+    config = config if isinstance(config, dict) else {"userAgent": userAgent}
+
+    try:
+        response = _form_post(url, data, config=config, args=args, include_device_code=False, timeout=5)
+        res = response.json()
+        _assert_session(res)
+        if _is_plan_empty_body(res):
+            return {}
+        return _require_data(response, "获取默认实习计划失败") or {}
+    except Exception as e:
+        raise RuntimeError(f"默认计划接口请求异常: {e}")
+
+
 def get_open_id(config, code):
     logging.info("正在获取open_id...")
-    headers = {
-        "v": XYB_VERSION,
-        "xweb_xhr": "1",
-        "content-type": "application/x-www-form-urlencoded",
-        "referer": XYB_REFERER,
-        'User-Agent': config['userAgent'],
-        "devicecode": get_device_code("", config['device']),
-    }
     url = "https://xcx.xybsyw.com/common/getOpenId.action"
     data = {"code": code}
 
     try:
-        logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}")
-        response = requests.post(url=url, headers=headers, data=data, allow_redirects=False, timeout=5)
+        security = _build_security_context(data, config)
+        headers = {
+            **_base_xyb_headers(config),
+            "devicecode": get_device_code("", config['device']),
+        }
+        request_data = {**data, **security["params"]}
+        logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{request_data}")
+        response = requests.post(
+            url=url,
+            headers=headers,
+            data=request_data,
+            params={"t": security["url_token"]},
+            allow_redirects=False,
+            timeout=5,
+        )
         logging.debug(f"📡 收到响应:{response} {response.text}")
         res = response.json()
         if res.get('code') == '202':
             raise RuntimeError(f'code已失效，请重启小程序。接口响应：{res}')
-        return res['data']
+        return _require_data(response, "获取OpenID失败")
     except Exception as e:
         raise RuntimeError(f"获取OpenID失败: {e}")
 
@@ -218,29 +343,18 @@ def wx_login(config, openIdData):
         "openId": openIdData['openId'],
         "unionId": openIdData['unionId']
     }
-    header_token = get_header_token(data)
-    headers = {
-        "wechat": "1",
-        "v": XYB_VERSION,
-        "xweb_xhr": "1",
-        "content-type": "application/x-www-form-urlencoded",
-        "referer": XYB_REFERER,
-        "n": header_token['n'],
-        "devicecode": get_device_code(openId=openIdData['openId'], device=config['device']),
-        "encryptvalue": openIdData['encryptValue'],
-        "m": header_token['m'],
-        "s": header_token['s'],
-        "t": header_token['t'],
-        "user-agent": config['userAgent'],
-    }
-    cookies = {"JSESSIONID": openIdData['sessionId']}
     url = "https://xcx.xybsyw.com/login/login!wx.action"
     try:
-        logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-        response = requests.post(url, headers=headers, cookies=cookies, data=data, timeout=5)
+        response = _form_post(
+            url,
+            data,
+            config=config,
+            args=openIdData,
+            include_device_code=True,
+            timeout=5,
+        )
         logging.debug(f"📡 收到响应:{response} {response.text}")
-        res = response.json()
-        return res['data']
+        return _require_data(response, "登录失败")
     except Exception as e:
         raise RuntimeError(f"登录失败: {e}")
 
@@ -301,14 +415,13 @@ def login(config, use_cache=True):
 
 
 def photo_sign_in_or_out(args, config, geo, traineeId, opt):
-    # watermark_info(args=args, config=config, traineeId=traineeId)
     logging.info('正在执行拍照签到流程...')
 
+    watermark = watermark_info(args=args, config=config, traineeId=traineeId)
+    watermarked_path = render_watermarked_photo(opt.get('image_path'), watermark, geo.get('formatted_address', ''))
     policyData = commonPostPolicy(args=args, config=config)
-
     timestamp = get_timestamp()
-
-    files = get_img_file(timestamp, opt.get('image_path'))
+    files = get_img_file(timestamp, watermarked_path)
     try:
         ossData = aliyun_OSS(files=files, timestamp=timestamp, policyData=policyData,config=config)
         post_new(args=args, config=config, traineeId=traineeId, geo=geo, imgUrl=ossData['key'], opt=opt)
@@ -317,6 +430,10 @@ def photo_sign_in_or_out(args, config, geo, traineeId, opt):
         file_obj = files.get("file", [None, None, None])[1]
         if file_obj:
             file_obj.close()
+        try:
+            os.remove(watermarked_path)
+        except OSError:
+            pass
 
 
 def watermark_info(args, config, traineeId):
@@ -326,28 +443,48 @@ def watermark_info(args, config, traineeId):
         "traineeId": str(traineeId)
     }
 
-    header_token = get_header_token(data)
-
-    headers = {
-        "content-type": "application/x-www-form-urlencoded",
-        "encryptvalue": args['encryptValue'],
-        "m": header_token['m'],
-        "n": header_token['n'],
-        "s": header_token['s'],
-        "t": header_token['t'],
-        "referer": XYB_REFERER,
-        "user-agent": config['userAgent'],
-        "v": XYB_VERSION,
-        "wechat": "1",
-        "xweb_xhr": "1"
-    }
-    cookies = {"JSESSIONID": args['sessionId']}
-
-    logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-    response = requests.post(url, headers=headers, cookies=cookies, data=data)
-    logging.debug(f"📡 收到响应:{response} {response.text}")
-
+    response = _form_post(url, data, config=config, args=args, include_device_code=False, timeout=5)
     logging.info(f"{response} {response.text}")
+    return _require_data(response, "获取拍照打卡水印信息失败")
+
+
+def _load_watermark_font(size):
+    candidates = [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                pass
+    return ImageFont.load_default()
+
+
+def render_watermarked_photo(image_path, watermark, address):
+    source_path = check_img(image_path)
+    with Image.open(source_path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        scale = min(3000 / width, 3000 / height, 1)
+        if scale < 1:
+            image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), Image.LANCZOS)
+
+        draw = ImageDraw.Draw(image)
+        draw.text((100, 70), str(watermark.get("time", "")), fill=(255, 255, 255), font=_load_watermark_font(48))
+        draw.text((280, 70), str(watermark.get("today", "")), fill=(255, 255, 255), font=_load_watermark_font(32))
+        draw.text((100, 120), str(address or ""), fill=(255, 255, 255), font=_load_watermark_font(28))
+        draw.text((100, 155), str(watermark.get("info", "")), fill=(255, 255, 255), font=_load_watermark_font(28))
+
+        out_width = max(1, int(image.size[0] * 0.8))
+        out_height = max(1, int(image.size[1] * 0.8))
+        image = image.resize((out_width, out_height), Image.LANCZOS)
+        fd, out_path = tempfile.mkstemp(prefix="xyb-watermark-", suffix=".jpg")
+        os.close(fd)
+        image.save(out_path, format="JPEG", quality=80)
+        return out_path
 
 
 def commonPostPolicy(args, config):
@@ -360,36 +497,9 @@ def commonPostPolicy(args, config):
         "publicRead": "true"
     }
 
-    header_token = get_header_token(data)
-    headers = {
-        "content-type": "application/x-www-form-urlencoded",
-        "devicecode": get_device_code(openId=args['openId'], device=config['device']),
-        "encryptvalue": args['encryptValue'],
-        "m": header_token['m'],
-        "n": header_token['n'],
-        "referer": XYB_REFERER,
-        "s": header_token['s'],
-        "t": header_token['t'],
-        "user-agent": config['userAgent'],
-        "v": XYB_VERSION,
-        "wechat": "1",
-        "xweb_xhr": "1"
-    }
-    cookies = {
-        "JSESSIONID": args['sessionId']
-    }
-
-    logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-    response = requests.post(url, headers=headers, cookies=cookies, data=data)
-    logging.debug(f"📡 收到响应:{response} {response.text}")
-
+    response = _form_post(url, data, config=config, args=args, include_device_code=True, timeout=5)
     logging.info(f"{response} {response.text}")
-
-    res = response.json()
-    if response.status_code != 200 or res['code'] != "200":
-        raise RuntimeError(f"commonPostPolicy请求异常, {response} {response.text}")
-
-    return res['data']
+    return _require_data(response, "commonPostPolicy请求异常")
 
 
 def aliyun_OSS(files, timestamp, policyData,config):
@@ -448,30 +558,8 @@ def post_new(args, config, traineeId, geo, imgUrl, opt):
         "addressId": "null"
     }
 
-    header_token = get_header_token(data)
-    headers = {
-        "content-type": "application/x-www-form-urlencoded",
-        "devicecode": get_device_code(openId=args['openId'], device=config['device']),
-        "encryptvalue": args['encryptValue'],
-        "m": header_token['m'],
-        "n": header_token['n'],
-        "referer": XYB_REFERER,
-        "s": header_token['s'],
-        "t": header_token['t'],
-        "user-agent": config['userAgent'],
-        "v": XYB_VERSION,
-        "wechat": "1",
-        "xweb_xhr": "1"
-    }
-    cookies = {"JSESSIONID": args['sessionId']}
-
-    logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-    response = requests.post(url, headers=headers, cookies=cookies, data=data)
-    logging.debug(f"📡 收到响应:{response} {response.text}")
-
-    res = response.json()
-    if response.status_code != 200 or res['code'] != "200":
-        raise RuntimeError(f"post_new请求异常, {response} {response.text}")
+    response = _form_post(url, data, config=config, args=args, include_device_code=True, timeout=5)
+    _require_success(response, "post_new请求异常")
 
 
 def deliver_value(args, config, traineeId):
@@ -517,25 +605,13 @@ def simple_sign_in_or_out(args, geo, traineeId, config, opt):
             'system': device['system'], 'openId': args['openId'], 'unionId': args['unionId'],
             'lng': config['location']['longitude'], 'lat': config['location']['latitude'],
             'address': geo['formatted_address'], 'deviceName': device['model'], }
-    header_token = get_header_token(data)
-    headers = {'v': XYB_VERSION, 'wechat': "1",
-               'Referer': XYB_REFERER,
-               'User-Agent': config['userAgent'],
-               'n': header_token['n'],
-               'm': header_token['m'], 's': header_token['s'], 't': header_token['t'],
-               'encryptvalue': args['encryptValue'],
-               'devicecode': get_device_code(openId=args['openId'], device=config['device']), }
-    cookies = {"JSESSIONID": args['sessionId']}
 
     try:
-        logging.debug(f"🛩️ 准备发起请求。url:{url}, headers:{headers}, data:{data}, cookies:{cookies}")
-        response = requests.post(url, data=data, headers=headers, cookies=cookies, timeout=5)
+        response = _form_post(url, data, config=config, args=args, include_device_code=True, timeout=5)
         logging.debug(f"📡 收到响应:{response} {response.text}")
         res = response.json()
 
-        if not check_session_validity(res):
-            handle_invalid_session()
-            raise RuntimeError('❌ JSESSIONID已失效，请重新获取code')
+        _assert_session(res)
 
         msg = res['msg']
         code = res['code']
