@@ -358,7 +358,12 @@ class GetCodeAndSessionThread(QThread):
             self.do_cert()
 
             ### 唤起微信小程序
+            # 注意: Weixin 4.x 桌面版参数名是 app_id（不是 appid），
+            # appid= 会导致小程序只启动运行时不出窗口。
+            # 顺序: app_id 优先（新版微信），appid 回退（兼容旧版微信 3.x）
             weixin_urls = [
+                f"weixin://launchapplet/?app_id={XYB_APP_ID}",
+                f"weixin://launchapplet?app_id={XYB_APP_ID}",
                 f"weixin://launchapplet/?appid={XYB_APP_ID}",
                 f"weixin://launchapplet?appid={XYB_APP_ID}",
             ]
